@@ -13,15 +13,56 @@ class ContactMap:
     Class for loading and managing native contact maps.
     """
     
-    def __init__(self, input_file: str):
+    def __init__(self, 
+                 input_file: str,
+                 cluster_number: int = 10,
+                 cutoff_size: int = 5,
+                 draw_map: bool = True,
+                 output_base_name: Optional[str] = None,
+                 output_format: str = "png",
+                 show_plot: bool = True):
         """
         Initialize ContactMap by loading contacts from a file.
         
+        After loading, performs clustering and optionally draws the contact map.
+        Saves the clustered dataframe to results/contacts_{n}_clusters.csv.
+        
         Args:
             input_file (str): Path to contacts file (whitespace-separated table with columns: i, j, r6, r12)
+            cluster_number (int): Desired number of clusters (default: 10)
+            cutoff_size (int): Minimum cluster size to retain (default: 5)
+            draw_map (bool): Whether to draw the contact map after clustering (default: True)
+            output_base_name (str): Base name for output files. If None, auto-generates from input file name (default: None)
+            output_format (str): Output format for the plot ('png' or 'svg', default: 'png')
+            show_plot (bool): Whether to display the plot (default: True)
         """
         self.input_file = input_file
         self.df = self._load_contacts()
+        
+        # Perform clustering
+        self._cluster(cluster_number=cluster_number, cutoff_size=cutoff_size)
+        
+        # Determine output base name
+        if output_base_name is None:
+            n_clusters = self.df['cluster'].nunique()
+            output_base_name = f"contacts_{n_clusters}_clusters"
+        
+        self.output_base_name = output_base_name
+        
+        # Save dataframe
+        os.makedirs('results', exist_ok=True)
+        csv_path = f'results/{output_base_name}.csv'
+        required_columns = ['i', 'j', 'r6', 'r12', 'r', 'cluster']
+        output_df = self.df[required_columns].copy()
+        output_df.to_csv(csv_path, index=False)
+        
+        # Draw map if requested
+        if draw_map:
+            self.draw(
+                output_base_name=output_base_name,
+                output_format=output_format,
+                show_plot=show_plot
+            )
     
     def _load_contacts(self) -> pd.DataFrame:
         """
@@ -59,7 +100,7 @@ class ContactMap:
         cluster_info = f", clusters={self.df['cluster'].nunique()}" if has_clusters else ""
         return f"ContactMap(file='{self.input_file}', contacts={len(self.df)}{cluster_info})"
     
-    def cluster(self, 
+    def _cluster(self, 
                 cluster_number: int = 10, 
                 cutoff_size: int = 5) -> None:
         """
@@ -279,7 +320,8 @@ class ContactMap:
              title: str = "Contact Map with Clusters",
              output_format: str = "png",
              save_plot: bool = True,
-             show_plot: bool = True) -> None:
+             show_plot: bool = True,
+             output_base_name: Optional[str] = None) -> None:
         """
         Draw a contact map showing contacts as rectangles below the diagonal, 
         with different colors for each cluster.
@@ -293,6 +335,7 @@ class ContactMap:
             output_format (str): Output format ('png' or 'svg', default: 'png')
             save_plot (bool): Whether to save the plot to results/plots (default: True)
             show_plot (bool): Whether to display the plot (default: True)
+            output_base_name (str): Base name for output file. If None, uses self.output_base_name or auto-generates (default: None)
         """
         # Check if clustering has been performed
         if 'cluster' not in self.df.columns:
@@ -424,8 +467,14 @@ class ContactMap:
         # Save plot if requested
         if save_plot:
             os.makedirs('results/plots', exist_ok=True)
-            base_name = os.path.splitext(os.path.basename(self.input_file))[0]
-            filename = f'results/plots/{base_name}_contact_map.{output_format}'
+            if output_base_name is None:
+                if hasattr(self, 'output_base_name') and self.output_base_name:
+                    base_name = self.output_base_name
+                else:
+                    base_name = os.path.splitext(os.path.basename(self.input_file))[0]
+            else:
+                base_name = output_base_name
+            filename = f'results/plots/{base_name}.{output_format}'
             plt.savefig(filename, format=output_format, dpi=300, bbox_inches='tight')
         
         if show_plot:
