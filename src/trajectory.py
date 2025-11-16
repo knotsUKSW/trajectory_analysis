@@ -502,10 +502,13 @@ class Trajectory:
             cluster_series = pd.Series(cluster_values)
             cluster_running_avg = cluster_series.rolling(window=window_size, center=True, min_periods=1).mean()
             
+            # Use black for cluster_0, otherwise use color from colormap
+            plot_color = 'black' if cluster_num == 0 else colors[idx]
+            
             # Plot raw data (light) and running average (bold)
             if raw_values:
-                ax2.plot(frames, cluster_values, alpha=0.3, color=colors[idx], linewidth=0.5)
-            ax2.plot(frames, cluster_running_avg, color=colors[idx], 
+                ax2.plot(frames, cluster_values, alpha=0.3, color=plot_color, linewidth=0.5)
+            ax2.plot(frames, cluster_running_avg, color=plot_color, 
                     label=f'Cluster {cluster_num} (avg)', linewidth=1)
         
         ax2.set_xlabel('Frame Number', fontsize=12)

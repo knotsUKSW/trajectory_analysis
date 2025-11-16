@@ -106,9 +106,7 @@ python run.py contacts parse data/BDD.cont \
     --no-show
 ```
 
-### Contact Map Visualization (Backup Method)
-
-**Note**: This is a backup method for creating visualizations from existing CSV files. For new contact files, use `contacts parse` instead, which automatically creates visualizations.
+#### Contact Map Visualization
 
 **`draw`** - Creates a contact map visualization from an existing clustered CSV file.
 
