@@ -15,3 +15,9 @@ wheels/
 # Results and data files
 results/
 data/
+
+# Rust build artifacts
+rust/target/
+rust/Cargo.lock
+**/*.rs.bk
+.cargo/
