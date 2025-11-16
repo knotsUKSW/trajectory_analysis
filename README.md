@@ -396,6 +396,135 @@ folding_analysis/
 - click
 - scikit-learn
 
+## Rust Backend
+
+This project uses a Rust backend for high-performance trajectory parsing and analysis. The Rust library provides Python bindings that are automatically used by the Python code.
+
+### Prerequisites
+
+To build the Rust components from scratch, you need:
+
+1. **Rust toolchain** (version 1.73+):
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   # or update existing installation:
+   rustup update
+   ```
+
+2. **maturin** (for building Python bindings):
+   ```bash
+   pip install maturin
+   # or using uv:
+   uv add maturin
+   ```
+
+### Building the Rust Library
+
+#### Building the Rust Library Only (without Python bindings)
+
+```bash
+cd rust
+cargo build --release
+```
+
+This will create a release build of the Rust library in `rust/target/release/`.
+
+#### Building Python Bindings
+
+The Python bindings are required for the Python code to work. To build them:
+
+```bash
+cd rust
+maturin develop --features python
+```
+
+This will:
+- Compile the Rust library with Python bindings enabled
+- Install the `folding_analysis_rs` Python module in your current Python environment
+- Make the module available for import in Python
+
+**Note**: Make sure you have activated your Python virtual environment before running `maturin develop`:
+
+```bash
+# If using uv
+source .venv/bin/activate
+
+# Then build
+cd rust
+maturin develop --features python
+```
+
+#### Building for Distribution
+
+To build a wheel for distribution:
+
+```bash
+cd rust
+maturin build --features python
+```
+
+This creates a wheel file in `rust/target/wheels/` that can be installed with `pip`.
+
+### Verifying the Installation
+
+After building, you can verify the Python bindings are working:
+
+```python
+import folding_analysis_rs
+print("✅ Rust bindings loaded successfully")
+```
+
+### Project Structure (Rust)
+
+```
+rust/
+├── Cargo.toml          # Rust project configuration
+├── pyproject.toml      # Maturin configuration for Python bindings
+├── src/
+│   ├── lib.rs         # Main library entry point
+│   ├── structure.rs   # Core data structures (Coordinate, FrameData)
+│   ├── trajectory.rs   # Trajectory trait and implementations
+│   ├── contacts.rs    # Contact-related structures
+│   └── python_bindings.rs  # PyO3 bindings for Python
+└── target/            # Build artifacts (generated)
+```
+
+### Rust Features
+
+The Rust backend provides:
+
+- **Fast PDB parsing**: Manual parsing optimized for CA atoms only
+- **Efficient distance calculations**: Custom distance computation
+- **Progress tracking**: Visual progress bars using `indicatif`
+- **CSV I/O**: Fast CSV reading and writing with `csv` crate
+- **Trajectory analysis**: Window-based summarization, smoothing, and classification
+
+### Troubleshooting
+
+**Issue**: `ImportError: Rust bindings (folding_analysis_rs) are required`
+
+**Solution**: Build the Python bindings:
+```bash
+cd rust
+maturin develop --features python
+```
+
+**Issue**: Rust compiler version too old
+
+**Solution**: Update Rust:
+```bash
+rustup update
+```
+
+**Issue**: PyO3 version mismatch
+
+**Solution**: The project uses PyO3 0.22. Make sure your Rust version is 1.73+ and rebuild:
+```bash
+cd rust
+cargo clean
+maturin develop --features python
+```
+
 ## License
 
 [Add your license here]

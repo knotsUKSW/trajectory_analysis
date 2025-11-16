@@ -57,15 +57,11 @@ def trajectory():
               type=click.Choice(['png', 'svg'], case_sensitive=False),
               default='png',
               help='Output format for plots (default: png)')
-@click.option('--show-plot',
-              is_flag=True,
-              default=False,
-              help='Display plots (default: False)')
 @click.option('--animate',
               is_flag=True,
               default=False,
               help='Create animation (default: False)')
-def parse_trajectory(input_file_path, contacts, cutoff_distance, max_frames, window_size, cutoff, output_format, show_plot, animate):
+def parse_trajectory(input_file_path, contacts, cutoff_distance, max_frames, window_size, cutoff, output_format, animate):
     """
     Main method for parsing trajectory: reads, draws, summarizes, and classifies.
     
@@ -131,9 +127,7 @@ def parse_trajectory(input_file_path, contacts, cutoff_distance, max_frames, win
             window_size=window_size,
             cutoff=cutoff,
             output_format=output_format,
-            show_plot=show_plot,
-            animate=animate,
-            return_summary=False
+            animate=animate
         )
         
         # Get output directory
@@ -173,14 +167,7 @@ def parse_trajectory(input_file_path, contacts, cutoff_distance, max_frames, win
               type=int,
               default=None,
               help='Maximum number of frames to process (for debugging, default: all frames)')
-@click.option('--save-csv/--no-save-csv',
-              default=True,
-              help='Save results to CSV file (default: True)')
-@click.option('--output-csv',
-              type=click.Path(),
-              default=None,
-              help='Path for output CSV file (default: auto-generated as {base}_parsed.csv)')
-def read_trajectory(input_file_path, contacts, cutoff_distance, max_frames, save_csv, output_csv):
+def read_trajectory(input_file_path, contacts, cutoff_distance, max_frames):
     """
     Read trajectory file and calculate native contact formation.
     
@@ -206,7 +193,6 @@ def read_trajectory(input_file_path, contacts, cutoff_distance, max_frames, save
         config_table.add_row("🔢 Max frames:", f"[yellow]{max_frames}[/yellow] [dim](debug mode)[/dim]")
     else:
         config_table.add_row("🔢 Max frames:", "[green]All[/green]")
-    config_table.add_row("💾 Save CSV:", f"[green]{'Yes' if save_csv else 'No'}[/green]")
     
     console.print(config_table)
     console.print()
@@ -226,17 +212,24 @@ def read_trajectory(input_file_path, contacts, cutoff_distance, max_frames, save
         trajectory = Trajectory(input_file_path, contacts)
         console.print(f"✅ [green]Loaded {trajectory.total_contacts} native contacts[/green]")
         
-        # Read trajectory
+        # Read trajectory (always saves to CSV)
         console.print(f"\n🔍 [bold]Reading trajectory...[/bold]")
-        df = trajectory.read_trajectory(
+        trajectory.read_trajectory(
             cutoff_distance=cutoff_distance,
-            max_frames=max_frames,
-            save_csv=save_csv,
-            output_csv_path=output_csv,
-            return_df=True
+            max_frames=max_frames
         )
         
-        if df is None or df.empty:
+        # Load the saved CSV to get statistics
+        base_name = os.path.splitext(os.path.basename(input_file_path))[0]
+        output_dir = os.path.dirname(input_file_path) or '.'
+        output_path = os.path.join(output_dir, f"{base_name}_parsed.csv")
+        
+        if not os.path.exists(output_path):
+            raise ValueError("Failed to read trajectory - output file not found")
+        
+        df = pd.read_csv(output_path)
+        
+        if df.empty:
             raise ValueError("Failed to read trajectory or trajectory is empty")
         
         console.print(f"\n✅ [bold green]Reading complete![/bold green]")
@@ -244,14 +237,8 @@ def read_trajectory(input_file_path, contacts, cutoff_distance, max_frames, save
         console.print(f"📈 Q range: [cyan]{df['q'].min():.3f} - {df['q'].max():.3f}[/cyan]")
         console.print(f"📊 Average contacts per frame: [cyan]{df['contacts'].mean():.1f}[/cyan]")
         
-        if save_csv:
-            if output_csv:
-                output_path = output_csv
-            else:
-                base_name = os.path.splitext(os.path.basename(input_file_path))[0]
-                output_dir = os.path.dirname(input_file_path) or '.'
-                output_path = os.path.join(output_dir, f"{base_name}_parsed.csv")
-            console.print(f"💾 Results saved to: [cyan]{output_path}[/cyan]")
+        console.print(f"\n💾 [bold]Output file:[/bold]")
+        console.print(f"📄 CSV: [cyan]{output_path}[/cyan]")
         
         # Display first few rows
         console.print(f"\n📄 [bold]First few rows:[/bold]")
@@ -347,41 +334,21 @@ def draw_trajectory(input_file_path, contacts, csv, cutoff_distance, max_frames,
         trajectory = Trajectory(input_file_path, contacts)
         console.print(f"✅ [green]Loaded {trajectory.total_contacts} native contacts[/green]")
         
-        # Load or parse data
-        df = None
-        if csv:
-            console.print(f"\n📄 [bold]Loading trajectory data from CSV...[/bold]")
-            df = pd.read_csv(csv)
-            # Convert string representations back to dicts/lists if needed
-            if 'clusters_filling' in df.columns and df['clusters_filling'].dtype == 'object':
-                # Check if it's string representation
-                if isinstance(df['clusters_filling'].iloc[0], str):
-                    df['clusters_filling'] = df['clusters_filling'].apply(ast.literal_eval)
-            if 'contact_list' in df.columns and df['contact_list'].dtype == 'object':
-                if isinstance(df['contact_list'].iloc[0], str):
-                    df['contact_list'] = df['contact_list'].apply(ast.literal_eval)
-            console.print(f"✅ [green]Loaded {len(df)} frames from CSV[/green]")
-        else:
+        # Read trajectory if needed
+        if not csv:
             console.print(f"\n🔍 [bold]Reading trajectory...[/bold]")
-            df = trajectory.read_trajectory(
+            trajectory.read_trajectory(
                 cutoff_distance=cutoff_distance,
-                max_frames=max_frames,
-                save_csv=False,
-                return_df=True
+                max_frames=max_frames
             )
-            if df is None or df.empty:
-                raise ValueError("Failed to read trajectory or trajectory is empty")
-            console.print(f"✅ [green]Read {len(df)} frames[/green]")
+            console.print(f"✅ [green]Trajectory read and saved[/green]")
         
         # Create visualization
         console.print(f"\n🎨 [bold]Creating visualization...[/bold]")
         
         trajectory.draw(
-            df=df,
             window_size=window_size,
-            save_plot=True,
-            output_format=output_format,
-            show_plot=not no_show
+            output_format=output_format
         )
         
         # Determine output path
@@ -499,49 +466,34 @@ def summarize_trajectory(input_file_path, contacts, csv, cutoff_distance, max_fr
         trajectory = Trajectory(input_file_path, contacts)
         console.print(f"✅ [green]Loaded {trajectory.total_contacts} native contacts[/green]")
         
-        # Load or parse data
-        df = None
-        if csv:
-            console.print(f"\n📄 [bold]Loading trajectory data from CSV...[/bold]")
-            if not os.path.exists(csv):
-                raise FileNotFoundError(f"CSV file not found: {csv}")
-            df = pd.read_csv(csv)
-            # Convert string representations back to dicts
-            if 'clusters_filling' in df.columns:
-                df['clusters_filling'] = df['clusters_filling'].apply(
-                    lambda x: ast.literal_eval(x) if isinstance(x, str) else x
-                )
-            console.print(f"✅ [green]Loaded {len(df)} frames from CSV[/green]")
-        else:
+        # Read trajectory if needed
+        if not csv:
             console.print(f"\n🔍 [bold]Reading trajectory...[/bold]")
-            df = trajectory.read_trajectory(
+            trajectory.read_trajectory(
                 cutoff_distance=cutoff_distance,
-                max_frames=max_frames,
-                save_csv=False,
-                return_df=True
+                max_frames=max_frames
             )
-            if df is None or df.empty:
-                raise ValueError("Failed to read trajectory or trajectory is empty")
-            console.print(f"✅ [green]Read {len(df)} frames[/green]")
+            console.print(f"✅ [green]Trajectory read and saved[/green]")
         
         # Create summary
         console.print(f"\n📊 [bold]Creating trajectory summary...[/bold]")
         if cutoff is not None:
             console.print(f"[dim]Using binary mode with cutoff={cutoff}[/dim]")
-        summary_df = trajectory.summarize_trajectory(
-            df=df,
+        trajectory.summarize_trajectory(
             window_size=window_size,
-            save_csv=True,
-            output_csv_path=output_csv,
             cutoff=cutoff
         )
         
-        # Determine output path
-        actual_output_csv = output_csv
-        if actual_output_csv is None:
-            base_name = os.path.splitext(os.path.basename(input_file_path))[0]
-            output_dir = os.path.dirname(input_file_path) or '.'
+        # Determine output path and load for display
+        base_name = os.path.splitext(os.path.basename(input_file_path))[0]
+        output_dir = os.path.dirname(input_file_path) or '.'
+        if cutoff is not None:
+            actual_output_csv = os.path.join(output_dir, f"{base_name}_summary_binary_{cutoff}.csv")
+        else:
             actual_output_csv = os.path.join(output_dir, f"{base_name}_summary.csv")
+        
+        # Load summary for display
+        summary_df = pd.read_csv(actual_output_csv, index_col=0)
         
         console.print(f"\n✅ [bold green]Summary complete![/bold green]")
         console.print(f"📊 Summary shape: [cyan]{summary_df.shape}[/cyan] (windows x clusters)")
@@ -557,12 +509,8 @@ def summarize_trajectory(input_file_path, contacts, csv, cutoff_distance, max_fr
         if plot:
             console.print(f"\n🎨 [bold]Creating summary plot...[/bold]")
             trajectory.plot_summary(
-                summary_df=summary_df,
-                figsize=(14, 8),
-                save_plot=True,
-                output_format=output_format,
-                show_plot=not no_show,
-                cutoff=cutoff
+                cutoff=cutoff,
+                output_format=output_format
             )
             
             # Determine plot output path
@@ -690,52 +638,39 @@ def plot_summary(input_file_path, contacts, summary_csv, csv, cutoff_distance, m
                     summary_df[col] = (summary_df[col] >= cutoff).astype(int)
             console.print(f"✅ [green]Loaded summary with {len(summary_df)} windows and {len(summary_df.columns)} clusters[/green]")
         else:
-            # Generate summary from trajectory data
-            df = None
-            if csv:
-                console.print(f"\n📄 [bold]Loading trajectory data from CSV...[/bold]")
-                if not os.path.exists(csv):
-                    raise FileNotFoundError(f"CSV file not found: {csv}")
-                df = pd.read_csv(csv)
-                # Convert string representations back to dicts
-                if 'clusters_filling' in df.columns:
-                    df['clusters_filling'] = df['clusters_filling'].apply(
-                        lambda x: ast.literal_eval(x) if isinstance(x, str) else x
-                    )
-                console.print(f"✅ [green]Loaded {len(df)} frames from CSV[/green]")
-            else:
+            # Read trajectory if needed
+            if not csv:
                 console.print(f"\n🔍 [bold]Reading trajectory...[/bold]")
-                df = trajectory.read_trajectory(
+                trajectory.read_trajectory(
                     cutoff_distance=cutoff_distance,
-                    max_frames=max_frames,
-                    save_csv=False,
-                    return_df=True
+                    max_frames=max_frames
                 )
-                if df is None or df.empty:
-                    raise ValueError("Failed to read trajectory or trajectory is empty")
-                console.print(f"✅ [green]Read {len(df)} frames[/green]")
+                console.print(f"✅ [green]Trajectory read and saved[/green]")
             
             # Generate summary
             console.print(f"\n📊 [bold]Generating trajectory summary...[/bold]")
             if cutoff is not None:
                 console.print(f"[dim]Using binary mode with cutoff={cutoff}[/dim]")
-            summary_df = trajectory.summarize_trajectory(
-                df=df,
+            trajectory.summarize_trajectory(
                 window_size=window_size,
-                save_csv=False,
                 cutoff=cutoff
             )
+            
+            # Load summary for display
+            base_name = os.path.splitext(os.path.basename(input_file_path))[0]
+            output_dir = os.path.dirname(input_file_path) or '.'
+            if cutoff is not None:
+                summary_csv_path = os.path.join(output_dir, f"{base_name}_summary_binary_{cutoff}.csv")
+            else:
+                summary_csv_path = os.path.join(output_dir, f"{base_name}_summary.csv")
+            summary_df = pd.read_csv(summary_csv_path, index_col=0)
             console.print(f"✅ [green]Generated summary with {len(summary_df)} windows[/green]")
         
         # Create plot
         console.print(f"\n🎨 [bold]Creating summary plot...[/bold]")
         trajectory.plot_summary(
-            summary_df=summary_df,
-            figsize=(14, 8),
-            save_plot=True,
-            output_format=output_format,
-            show_plot=not no_show,
-            cutoff=cutoff
+            cutoff=cutoff,
+            output_format=output_format
         )
         
         # Determine plot output path
@@ -854,43 +789,32 @@ def classify_trajectory(input_file_path, contacts, summary_csv, csv, cutoff_dist
             console.print(f"✅ [green]Loaded summary with {len(summary_df)} windows[/green]")
         else:
             # Generate binary summary from trajectory data
-            df = None
-            if csv:
-                console.print(f"\n📄 [bold]Loading trajectory data from CSV...[/bold]")
-                if not os.path.exists(csv):
-                    raise FileNotFoundError(f"CSV file not found: {csv}")
-                df = pd.read_csv(csv)
-                if 'clusters_filling' in df.columns:
-                    df['clusters_filling'] = df['clusters_filling'].apply(
-                        lambda x: ast.literal_eval(x) if isinstance(x, str) else x
-                    )
-                console.print(f"✅ [green]Loaded {len(df)} frames from CSV[/green]")
-            else:
+            # Read trajectory if needed
+            if not csv:
                 console.print(f"\n🔍 [bold]Reading trajectory...[/bold]")
-                df = trajectory.read_trajectory(
+                trajectory.read_trajectory(
                     cutoff_distance=cutoff_distance,
-                    max_frames=max_frames,
-                    save_csv=False,
-                    return_df=True
+                    max_frames=max_frames
                 )
-                if df is None or df.empty:
-                    raise ValueError("Failed to read trajectory or trajectory is empty")
-                console.print(f"✅ [green]Read {len(df)} frames[/green]")
+                console.print(f"✅ [green]Trajectory read and saved[/green]")
             
             # Generate binary summary
             console.print(f"\n📊 [bold]Generating binary summary...[/bold]")
-            summary_df = trajectory.summarize_trajectory(
-                df=df,
+            trajectory.summarize_trajectory(
                 window_size=window_size,
-                save_csv=False,
                 cutoff=cutoff
             )
-            console.print(f"✅ [green]Generated binary summary with {len(summary_df)} windows[/green]")
+            
+            # Load summary for classification
+            base_name = os.path.splitext(os.path.basename(input_file_path))[0]
+            output_dir = os.path.dirname(input_file_path) or '.'
+            summary_csv_path = os.path.join(output_dir, f"{base_name}_summary_binary_{cutoff}.csv")
+            console.print(f"✅ [green]Generated binary summary[/green]")
         
         # Classify trajectory
         console.print(f"\n🔍 [bold]Classifying trajectory...[/bold]")
         formation_order = trajectory.classify(
-            summary_df_or_path=summary_df,
+            summary_df_or_path=summary_csv_path,
             output_path=output
         )
         
@@ -997,33 +921,27 @@ def animate_trajectory(input_file_path, contacts, csv, cutoff_distance, max_fram
         console.print(f"✅ [green]Loaded {trajectory.total_contacts} native contacts[/green]")
         
         # Load or read data
-        df = None
-        if csv:
-            console.print(f"\n📄 [bold]Loading trajectory data from CSV...[/bold]")
-            df = pd.read_csv(csv)
-            if 'clusters_filling' in df.columns and df['clusters_filling'].dtype == 'object':
-                if isinstance(df['clusters_filling'].iloc[0], str):
-                    df['clusters_filling'] = df['clusters_filling'].apply(ast.literal_eval)
-            if 'contact_list' in df.columns and df['contact_list'].dtype == 'object':
-                if isinstance(df['contact_list'].iloc[0], str):
-                    df['contact_list'] = df['contact_list'].apply(ast.literal_eval)
-            console.print(f"✅ [green]Loaded {len(df)} frames from CSV[/green]")
-        else:
+        # Read trajectory if needed
+        if not csv:
             console.print(f"\n🔍 [bold]Reading trajectory...[/bold]")
-            df = trajectory.read_trajectory(
+            trajectory.read_trajectory(
                 cutoff_distance=cutoff_distance,
-                max_frames=max_frames,
-                save_csv=False,
-                return_df=True
+                max_frames=max_frames
             )
-            if df is None or df.empty:
-                raise ValueError("Failed to read trajectory or trajectory is empty")
-            console.print(f"✅ [green]Read {len(df)} frames[/green]")
+            console.print(f"✅ [green]Trajectory read and saved[/green]")
+        
+        # Determine CSV path for animation
+        if csv:
+            csv_path = csv
+        else:
+            base_name = os.path.splitext(os.path.basename(input_file_path))[0]
+            output_dir = os.path.dirname(input_file_path) or '.'
+            csv_path = os.path.join(output_dir, f"{base_name}_parsed.csv")
         
         # Create animation
         console.print(f"\n🎬 [bold]Creating animation...[/bold]")
         trajectory.animate(
-            df=df,
+            csv_path=csv_path,
             interval=interval,
             save_animation=True,
             output_format=output_format,

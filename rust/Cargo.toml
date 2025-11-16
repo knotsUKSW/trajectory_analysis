@@ -1,0 +1,18 @@
+[package]
+name = "folding_analysis_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "folding_analysis_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+csv = "=1.1.2"
+serde = { version = "1.0", features = ["derive"] }
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+indicatif = "0.17"
+
+[features]
+default = []
+python = ["pyo3"]

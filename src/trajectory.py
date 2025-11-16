@@ -1,13 +1,19 @@
 import pandas as pd
-import random
 import numpy as np
 import ast
-from typing import Dict, List, Tuple, Optional, Union
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from typing import List, Tuple, Optional, Union
 import os
+import shutil
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from utils import get_file_lines
+
+try:
+    import folding_analysis_rs
+except ImportError:
+    raise ImportError(
+        "Rust bindings (folding_analysis_rs) are required. "
+        "Please install them by running: cd rust && maturin develop --features python"
+    )
 
 
 class Trajectory:
@@ -25,6 +31,7 @@ class Trajectory:
                 Must contain columns: 'i', 'j', 'r', 'cluster'
         """
         self.trajectory_file_path = trajectory_file_path
+        self.native_contacts_csv_path = native_contacts_csv  # Store path for Rust bindings
         
         # Load native contacts from CSV
         if not os.path.exists(native_contacts_csv):
@@ -51,239 +58,60 @@ class Trajectory:
         
         self.cluster_sizes = {cluster: len(contacts) for cluster, contacts in self.cluster_contacts.items()}
     
-    def _read_pdb_manual(self, max_frames: int = None) -> Dict[int, Dict[int, np.ndarray]]:
+    def _get_base_paths(self) -> Tuple[str, str]:
         """
-        Read PDB file manually and extract CA atom coordinates.
+        Get base name and output directory for trajectory file.
+    
+    Returns:
+            Tuple[str, str]: (base_name, output_dir)
+        """
+        base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
+        output_dir = os.path.dirname(self.trajectory_file_path) or '.'
+        return base_name, output_dir
+    
+    def _parse_clusters_filling(self, clusters_filling_str: Union[str, dict]) -> dict:
+        """
+        Parse clusters_filling from string representation or return dict as-is.
         
         Args:
-            max_frames (int): Maximum number of frames to read (None for all frames)
-        
+            clusters_filling_str: String representation of dict or dict itself
+            
         Returns:
-            Dict mapping frame number to dict mapping residue number to CA coordinates
+            dict: Parsed clusters_filling dictionary
         """
-        # First, count total lines for progress bar
-        total_lines = get_file_lines(self.trajectory_file_path)
-        frames_data = {}
-        current_model = None
-        current_residue_coords = {}
-        model_found = False
-        model_saved = False  # Track if current model has been saved
-        
-        # Read file with progress bar
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•"),
-            TextColumn("Lines: {task.completed}/{task.total}"),
-            TextColumn("•"),
-            TextColumn("Models: {task.fields[models]}"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            transient=False
-        ) as progress:
-            task = progress.add_task(
-                f"[cyan]Reading PDB file: {os.path.basename(self.trajectory_file_path)}",
-                total=total_lines,
-                models=0
-            )
-            
-            with open(self.trajectory_file_path, 'r') as f:
-                for line_num, line in enumerate(f, 1):
-                    progress.update(task, advance=1)
-                    
-                    if line.startswith('MODEL'):
-                        # Start of new model
-                        model_found = True
-                        # Only save previous model if it hasn't been saved yet (no ENDMDL encountered)
-                        if current_model is not None and not model_saved:
-                            frames_data[current_model] = current_residue_coords
-                            progress.update(task, models=len(frames_data))
-                        
-                        # Check if we've reached max_frames limit
-                        if max_frames is not None and len(frames_data) >= max_frames:
-                            break
-                        
-                        current_model = int(line.split()[1])
-                        current_residue_coords = {}
-                        model_saved = False  # New model, not saved yet
-                        progress.update(task, models=len(frames_data) + 1)
-                    
-                    elif line.startswith('ATOM') and ' CA ' in line:
-                        # Extract residue number and coordinates
-                        residue_num = int(line[22:26].strip())
-                        x = float(line[30:38].strip())
-                        y = float(line[38:46].strip())
-                        z = float(line[46:54].strip())
-                        
-                        current_residue_coords[residue_num] = np.array([x, y, z])
-                    
-                    elif line.startswith('ENDMDL'):
-                        # End of model - save the data
-                        if current_model is not None and not model_saved:
-                            frames_data[current_model] = current_residue_coords
-                            model_saved = True
-                            progress.update(task, models=len(frames_data))
-                            # Reset for next model (if any)
-                            current_residue_coords = {}
-                        
-                        # Check if we've reached max_frames limit
-                        if max_frames is not None and len(frames_data) >= max_frames:
-                            break
-            
-            # Handle last model if file doesn't end with ENDMDL (only if we haven't reached limit)
-            if max_frames is None or len(frames_data) < max_frames:
-                if current_model is not None and not model_saved and current_residue_coords:
-                    frames_data[current_model] = current_residue_coords
-                    progress.update(task, models=len(frames_data))
-                # Handle single-model files without MODEL/ENDMDL markers
-                elif not model_found and current_residue_coords:
-                    frames_data[1] = current_residue_coords
-                    progress.update(task, models=1)
-        
-        return frames_data
+        if isinstance(clusters_filling_str, dict):
+            return clusters_filling_str
+        elif isinstance(clusters_filling_str, str):
+            return ast.literal_eval(clusters_filling_str)
+        else:
+            return {}
 
     def read_trajectory(self,
                         cutoff_distance: float = 1.2,
-                        max_frames: Optional[int] = None,
-                        save_csv: bool = True,
-                        output_csv_path: Optional[str] = None,
-                        return_df: bool = False) -> Optional[pd.DataFrame]:
+                        max_frames: Optional[int] = None) -> None:
         """
         Read trajectory file and calculate native contact formation.
-    
+        
         For each model/frame in the PDB file, calculates distances between contact pairs
         and determines which contacts exist based on cutoff distance.
+        Always saves results to {base_name}_parsed.csv in the same directory as the trajectory file.
         
         Args:
             cutoff_distance (float): Multiplier for native distance 'r' (default: 1.2)
-                max_frames (int, optional): Maximum number of frames to process (None for all frames, useful for debugging)
-                save_csv (bool): Whether to save results to CSV file (default: True)
-                output_csv_path (str, optional): Path for output CSV file. If None, auto-generates from input path
-                return_df (bool): Whether to return the DataFrame (default: False)
-            
-        Returns:
-                Optional[pd.DataFrame]: DataFrame with columns:
-                - 'frame': frame number (int)
-                - 'contacts': number of existing contacts (int)
-                - 'q': fraction of native contacts existing (float)
-                - 'contact_list': list of existing contact pairs (List[Tuple[int, int]])
-                - 'clusters_filling': dict mapping cluster number to fraction (Dict[int, float])
-                    Returns None if return_df=False, otherwise returns the DataFrame
+            max_frames (int, optional): Maximum number of frames to process (None for all frames, useful for debugging)
         """
-        # Read PDB file using raw file reading (much faster than BioPython)
-        # Pass max_frames to stop reading early if limit is reached
-        frames_data = self._read_pdb_manual(max_frames=max_frames)
-
-        if not frames_data:
-            return None
-    
-        results = []
-        sorted_frame_nums = sorted(frames_data.keys())
-        total_frames = len(sorted_frame_nums)
+        # Determine output path
+        base_name, output_dir = self._get_base_paths()
+        output_csv_path = os.path.join(output_dir, f"{base_name}_parsed.csv")
         
-        # Process each frame with progress bar
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•"),
-            TextColumn("Frame: {task.completed}/{task.total}"),
-            TextColumn("•"),
-            TextColumn("Contacts: {task.fields[contacts]}"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            transient=False
-        ) as progress:
-            task = progress.add_task(
-                "[cyan]Processing frames and calculating contacts",
-                total=total_frames,
-                contacts=0
-            )
-            
-            for frame_num in sorted_frame_nums:
-                residue_coords = frames_data[frame_num]
-                
-                existing_contacts = []
-                cluster_counts = {cluster: 0 for cluster in self.cluster_contacts.keys()}
-                
-                # Check each native contact
-                for _, row in self.native_contacts.iterrows():
-                    i = int(row['i'])
-                    j = int(row['j'])
-                    r_native = row['r']
-                    cluster_num = int(row['cluster'])
-                    
-                    # Check if both residues exist in the structure
-                    if i in residue_coords and j in residue_coords:
-                        # Calculate distance between CA atoms
-                        coord_i = residue_coords[i]
-                        coord_j = residue_coords[j]
-                        distance = np.linalg.norm(coord_i - coord_j)
-                        
-                        # Check if contact exists (distance < r_native * cutoff_distance)
-                        if distance < r_native * cutoff_distance:
-                            existing_contacts.append((i, j))
-                            cluster_counts[cluster_num] += 1
-                
-                # Calculate q (fraction of native contacts existing)
-                q = len(existing_contacts) / self.total_contacts if self.total_contacts > 0 else 0.0
-                
-                # Calculate clusters_filling (fraction of contacts in each cluster)
-                clusters_filling = {}
-                for cluster_num, count in cluster_counts.items():
-                    cluster_size = self.cluster_sizes[cluster_num]
-                    if cluster_size > 0:
-                        clusters_filling[cluster_num] = count / cluster_size
-                    else:
-                        clusters_filling[cluster_num] = 0.0
-                
-                results.append({
-                    'frame': frame_num,
-                    'contacts': len(existing_contacts),
-                    'q': q,
-                    'contact_list': existing_contacts,
-                    'clusters_filling': clusters_filling
-                })
-            
-                # Update progress bar
-                progress.update(task, advance=1, contacts=len(existing_contacts))
-        
-        # Convert results to DataFrame
-        df = pd.DataFrame(results)
-        
-        # Sort by frame number
-        if not df.empty:
-            df = df.sort_values('frame').reset_index(drop=True)
-        
-        # Save to CSV if requested
-        if save_csv and not df.empty:
-            if output_csv_path is None:
-                # Auto-generate output path from input path
-                # Remove .pdb extension and add _parsed.csv suffix
-                base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
-                output_dir = os.path.dirname(self.trajectory_file_path) or '.'
-                output_csv_path = os.path.join(output_dir, f"{base_name}_parsed.csv")
-            
-            # Ensure output directory exists
-            output_dir = os.path.dirname(output_csv_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            
-            # Save DataFrame to CSV
-            # Note: contact_list and clusters_filling are complex types, so we'll convert them to strings
-            df_to_save = df.copy()
-            df_to_save['contact_list'] = df_to_save['contact_list'].apply(lambda x: str(x))
-            df_to_save['clusters_filling'] = df_to_save['clusters_filling'].apply(lambda x: str(x))
-            
-            df_to_save.to_csv(output_csv_path, index=False)
-        
-        if return_df:
-            return df
-        else:
-            return None
+        # Call Rust function
+        folding_analysis_rs.read_trajectory(
+            trajectory_file=self.trajectory_file_path,
+            contacts_file=self.native_contacts_csv_path,
+            cutoff_distance=cutoff_distance,
+            max_frames=max_frames,
+            output_csv=output_csv_path
+        )
     
     def parse(self,
               cutoff_distance: float = 1.2,
@@ -291,9 +119,7 @@ class Trajectory:
               window_size: int = 10000,
               cutoff: float = 0.5,
               output_format: str = "png",
-              show_plot: bool = False,
-              animate: bool = False,
-              return_summary: bool = False) -> Optional[pd.DataFrame]:
+              animate: bool = False):
         """
         Main method for parsing trajectory: reads, draws, summarizes, and classifies.
         
@@ -315,37 +141,20 @@ class Trajectory:
             window_size (int): Window size for summarization (default: 10000)
             cutoff (float): Cutoff for binary classification (default: 0.5)
             output_format (str): Output format for plots - 'png' or 'svg' (default: 'png')
-            show_plot (bool): Whether to display plots (default: False)
             animate (bool): Whether to create animation (default: False)
-            return_summary (bool): Whether to return the binary summary DataFrame (default: False)
-            
-        Returns:
-            Optional[pd.DataFrame]: Binary summary DataFrame if return_summary=True, else None
-        """
-        import shutil
         
+        """
         # Get trajectory directory for all output files
-        traj_dir = os.path.dirname(self.trajectory_file_path) or '.'
-        base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
+        base_name, traj_dir = self._get_base_paths()
         
         # Step 1: Read trajectory
-        df = self.read_trajectory(
+        self.read_trajectory(
             cutoff_distance=cutoff_distance,
-            max_frames=max_frames,
-            save_csv=True,
-            return_df=True
+            max_frames=max_frames
         )
         
-        if df is None or df.empty:
-            raise ValueError("Failed to read trajectory or trajectory is empty")
-        
-        # Step 2: Draw trajectory
-        self.draw(
-            df=df,
-            save_plot=True,
-            output_format=output_format,
-            show_plot=show_plot
-        )
+        # Step 2: Draw trajectory (uses default window_size=100, which will call smooth if needed)
+        self.draw(output_format=output_format)
         # Move plot to trajectory directory
         old_plot_path = f'results/plots/{base_name}_trajectory_analysis.{output_format}'
         new_plot_path = os.path.join(traj_dir, f"{base_name}_trajectory_analysis.{output_format}")
@@ -354,21 +163,15 @@ class Trajectory:
             shutil.move(old_plot_path, new_plot_path)
         
         # Step 3: Summarize trajectory (float mode)
-        summary_df = self.summarize_trajectory(
-            df=df,
+        self.summarize_trajectory(
             window_size=window_size,
-            save_csv=True,
-            output_csv_path=os.path.join(traj_dir, f"{base_name}_summarized.csv"),
             cutoff=None
         )
         
         # Step 4: Plot summary (float mode)
         self.plot_summary(
-            summary_df=summary_df,
-            save_plot=True,
-            output_format=output_format,
-            show_plot=show_plot,
-            cutoff=None
+            cutoff=None,
+            output_format=output_format
         )
         # Move plot to trajectory directory
         old_summary_plot = f'results/plots/{base_name}_summary.{output_format}'
@@ -378,39 +181,35 @@ class Trajectory:
             shutil.move(old_summary_plot, new_summary_plot)
         
         # Step 5: Summarize trajectory (binary mode)
-        binary_summary_df = self.summarize_trajectory(
-            df=df,
+        self.summarize_trajectory(
             window_size=window_size,
-            save_csv=True,
-            output_csv_path=os.path.join(traj_dir, f"{base_name}_summarized_binary.csv"),
             cutoff=cutoff
         )
         
         # Step 6: Plot binary summary
         self.plot_summary(
-            summary_df=binary_summary_df,
-            save_plot=True,
-            output_format=output_format,
-            show_plot=show_plot,
-            cutoff=cutoff
+            cutoff=cutoff,
+            output_format=output_format
         )
         # Move plot to trajectory directory
-        old_binary_plot = f'results/plots/{base_name}_summary.{output_format}'
+        old_binary_plot = f'results/plots/{base_name}_summary_binary_{cutoff}.{output_format}'
         new_binary_plot = os.path.join(traj_dir, f"{base_name}_summarized_binary.{output_format}")
         if os.path.exists(old_binary_plot):
             os.makedirs(traj_dir, exist_ok=True)
             shutil.move(old_binary_plot, new_binary_plot)
         
         # Step 7: Classify trajectory
+        binary_summary_path = os.path.join(traj_dir, f"{base_name}_summary_binary_{cutoff}.csv")
         formation_order = self.classify(
-            summary_df_or_path=binary_summary_df,
+            summary_df_or_path=binary_summary_path,
             output_path=os.path.join(traj_dir, f"{base_name}_class.txt")
         )
         
         # Step 8: Optionally animate
         if animate:
+            parsed_csv_path = os.path.join(traj_dir, f"{base_name}_parsed.csv")
             self.animate(
-                df=df,
+                csv_path=parsed_csv_path,
                 save_animation=True,
                 output_format="gif"
             )
@@ -420,59 +219,101 @@ class Trajectory:
             if os.path.exists(old_anim):
                 os.makedirs(traj_dir, exist_ok=True)
                 shutil.move(old_anim, new_anim)
+    
+    def smooth(self,
+               window_size: int = 100) -> None:
+        """
+        Smooth trajectory data by calculating running averages.
         
-        if return_summary:
-            return binary_summary_df
-        else:
-            return None
+        Calculates running average of q (fraction of all contacts) and per-cluster
+        fraction of contacts formed using a centered window.
+        Always saves results to {base_name}_{window_size}_smoothed.csv in the same directory as the trajectory file.
+    
+    Args:
+            window_size (int): Window size for running average (default: 100)
+        """
+        # Determine output path
+        base_name, output_dir = self._get_base_paths()
+        output_csv_path = os.path.join(output_dir, f"{base_name}_{window_size}_smoothed.csv")
+        
+        # Call Rust function
+        folding_analysis_rs.smooth(
+            trajectory_file=self.trajectory_file_path,
+            window_size=window_size,
+            output_csv=output_csv_path
+        )
     
     def draw(self, 
-             df: Optional[pd.DataFrame] = None,
              window_size: int = 100,
              figsize: Tuple[int, int] = (16, 6),
-             save_plot: bool = True,
              output_format: str = "png",
-             show_plot: bool = True,
              raw_values: bool = False) -> None:
         """
         Create a two-panel plot showing q and cluster filling over time.
         
         Args:
-            df (pd.DataFrame): DataFrame from read_trajectory() method. If None, will call read_trajectory() automatically.
-            window_size (int): Window size for running average (default: 100)
+            window_size (int): Window size for running average (default: 100).
+                If window_size > 1, uses smoothed data from {base_name}_{window_size}_smoothed.csv.
+                If window_size == 1, uses raw data from {base_name}_parsed.csv.
             figsize (Tuple[int, int]): Figure size (default: (16, 6))
-            save_plot (bool): Whether to save the plot (default: True)
             output_format (str): Output format - 'png' or 'svg' (default: 'png')
-            show_plot (bool): Whether to display the plot (default: True)
             raw_values (bool): Whether to plot the raw values (default: False)
         """
-        # If no DataFrame provided, read the trajectory
-        if df is None:
-            df = self.read_trajectory(save_csv=False, return_df=True)
-            if df is None:
-                df = pd.DataFrame()
+        base_name, output_dir = self._get_base_paths()
         
-        if df.empty:
+        # Determine input CSV path based on window_size
+        if window_size > 1:
+            # First, ensure smoothed data exists
+            smoothed_csv_path = os.path.join(output_dir, f"{base_name}_{window_size}_smoothed.csv")
+            if not os.path.exists(smoothed_csv_path):
+                # Generate smoothed data
+                self.smooth(window_size=window_size)
+            csv_path = smoothed_csv_path
+        else:
+            csv_path = os.path.join(output_dir, f"{base_name}_parsed.csv")
+        
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Trajectory CSV file not found: {csv_path}")
+        
+        # Load DataFrame from CSV
+        df_plot = pd.read_csv(csv_path)
+        
+        if df_plot.empty:
             raise ValueError("DataFrame is empty. Cannot create plot.")
         
         # Ensure DataFrame is sorted by frame
-        df = df.sort_values('frame').reset_index(drop=True)
+        df_plot = df_plot.sort_values('frame').reset_index(drop=True)
+        
+        # Load raw data if needed for raw_values overlay
+        if raw_values and window_size > 1:
+            raw_csv_path = os.path.join(output_dir, f"{base_name}_parsed.csv")
+            if os.path.exists(raw_csv_path):
+                df = pd.read_csv(raw_csv_path)
+                if 'clusters_filling' in df.columns:
+                    df['clusters_filling'] = df['clusters_filling'].apply(self._parse_clusters_filling)
+                df = df.sort_values('frame').reset_index(drop=True)
+            else:
+                df = None
+        else:
+            df = None
         
         # Create figure with two subplots side by side
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
         
         # Left panel: q vs frame
-        frames = df['frame'].values
-        q_values = df['q'].values
+        frames = df_plot['frame'].values
         
-        # Calculate running average for q
-        q_series = pd.Series(q_values)
-        q_running_avg = q_series.rolling(window=window_size, center=True, min_periods=1).mean()
+        if window_size > 1:
+            q_values = df_plot['q_smooth'].values
+            q_label = f'Running avg (window={window_size})'
+        else:
+            q_values = df_plot['q'].values
+            q_label = 'q'
         
         # Plot raw data (light) and running average (bold)
-        if raw_values:
-            ax1.plot(frames, q_values, alpha=0.3, color='blue', label='Raw', linewidth=0.5)
-        ax1.plot(frames, q_running_avg, color='blue', label=f'Running avg (window={window_size})', linewidth=2)
+        if raw_values and window_size > 1:
+            ax1.plot(df['frame'].values, df['q'].values, alpha=0.3, color='blue', label='Raw', linewidth=0.5)
+        ax1.plot(frames, q_values, color='blue', label=q_label, linewidth=2)
         ax1.set_xlabel('Frame Number', fontsize=12)
         ax1.set_ylabel('Fraction of Native Contacts (q)', fontsize=12)
         ax1.set_title('Native Contact Formation Over Time', fontsize=14, fontweight='bold')
@@ -480,36 +321,41 @@ class Trajectory:
         ax1.legend()
         
         # Right panel: clusters_filling vs frame
-        # Extract cluster data from clusters_filling column
-        # clusters_filling is a dict, so we need to extract each cluster's values
         cluster_numbers = sorted(self.cluster_contacts.keys())
         
         # Create a color map for clusters
         colors = plt.cm.tab10(np.linspace(0, 1, len(cluster_numbers)))
         
         for idx, cluster_num in enumerate(cluster_numbers):
-            # Extract cluster filling values for this cluster
-            cluster_values = []
-            for clusters_dict in df['clusters_filling']:
-                if isinstance(clusters_dict, dict):
-                    cluster_values.append(clusters_dict.get(cluster_num, 0.0))
+            if window_size > 1:
+                cluster_col = f'cluster_{cluster_num}_smooth'
+                if cluster_col in df_plot.columns:
+                    cluster_values = df_plot[cluster_col].values
                 else:
-                    # Handle string representation of dict
-                    if isinstance(clusters_dict, str):
-                        clusters_dict = ast.literal_eval(clusters_dict)
+                    continue
+            else:
+                # Extract cluster filling values from raw data
+                cluster_values = []
+                for clusters_dict in df_plot['clusters_filling']:
+                    clusters_dict = self._parse_clusters_filling(clusters_dict)
                     cluster_values.append(clusters_dict.get(cluster_num, 0.0))
-            
-            cluster_series = pd.Series(cluster_values)
-            cluster_running_avg = cluster_series.rolling(window=window_size, center=True, min_periods=1).mean()
+                cluster_values = np.array(cluster_values)
             
             # Use black for cluster_0, otherwise use color from colormap
             plot_color = 'black' if cluster_num == 0 else colors[idx]
             
-            # Plot raw data (light) and running average (bold)
-            if raw_values:
-                ax2.plot(frames, cluster_values, alpha=0.3, color=plot_color, linewidth=0.5)
-            ax2.plot(frames, cluster_running_avg, color=plot_color, 
-                    label=f'Cluster {cluster_num} (avg)', linewidth=1)
+            # Plot raw data (light) if requested and using smoothed data
+            if raw_values and window_size > 1 and df is not None:
+                df_raw = df.sort_values('frame').reset_index(drop=True)
+                cluster_raw_values = [
+                    self._parse_clusters_filling(clusters_dict).get(cluster_num, 0.0)
+                    for clusters_dict in df_raw['clusters_filling']
+                ]
+                ax2.plot(df_raw['frame'].values, cluster_raw_values, alpha=0.3, color=plot_color, linewidth=0.5)
+            
+            label_suffix = ' (avg)' if window_size > 1 else ''
+            ax2.plot(frames, cluster_values, color=plot_color, 
+                    label=f'Cluster {cluster_num}{label_suffix}', linewidth=1)
         
         ax2.set_xlabel('Frame Number', fontsize=12)
         ax2.set_ylabel('Cluster Filling Fraction', fontsize=12)
@@ -520,172 +366,71 @@ class Trajectory:
         # Adjust layout
         plt.tight_layout()
         
-        # Save plot if requested
-        if save_plot:
-            os.makedirs('results/plots', exist_ok=True)
-            base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
-            filename = f'results/plots/{base_name}_trajectory_analysis.{output_format}'
-            plt.savefig(filename, format=output_format, dpi=300, bbox_inches='tight')
-        
-        if show_plot:
-            plt.show()
-        else:
-            plt.close()
+        # Save plot
+        os.makedirs('results/plots', exist_ok=True)
+        filename = f'results/plots/{base_name}_trajectory_analysis.{output_format}'
+        plt.savefig(filename, format=output_format, dpi=300, bbox_inches='tight')
+        plt.close()
     
     def summarize_trajectory(self,
-                            df: Optional[pd.DataFrame] = None,
                             window_size: int = 10000,
-                            save_csv: bool = True,
-                            output_csv_path: str = None,
-                            cutoff: Optional[float] = None) -> pd.DataFrame:
+                            cutoff: Optional[float] = None) -> None:
         """
         Summarize trajectory by calculating mean cluster filling fractions in windows.
         
         Groups frames into windows and calculates the mean fraction of contacts
         established for each cluster in each window.
+        Always saves results to {base_name}_summary.csv or {base_name}_summary_binary_{cutoff}.csv
+        in the same directory as the trajectory file.
         
         Args:
-            df (pd.DataFrame): DataFrame from parse() method. If None, will attempt to load
-                from auto-generated CSV path based on trajectory file name.
             window_size (int): Number of frames per window (default: 10000)
-            save_csv (bool): Whether to save summary to CSV file (default: True)
-            output_csv_path (str): Path for output CSV file. If None, auto-generates from input path
             cutoff (float, optional): If provided, convert probabilities to binary (0 or 1).
                 Values >= cutoff become 1, values < cutoff become 0. If None, returns float probabilities.
-            
-        Returns:
-            pd.DataFrame: DataFrame with:
-                - Index: frame numbers (integers, starting frame of each window)
-                - Columns: cluster numbers (e.g., 'cluster_0', 'cluster_1', etc.)
-                - Values: mean fraction of contacts established in that window for that cluster (float),
-                  or binary values (0 or 1) if cutoff is provided
         """
-        # Load DataFrame if not provided
-        if df is None:
-            # Try to load from auto-generated CSV path
-            base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
-            output_dir = os.path.dirname(self.trajectory_file_path) or '.'
-            csv_path = os.path.join(output_dir, f"{base_name}_contacts.csv")
-            
-            if not os.path.exists(csv_path):
-                raise FileNotFoundError(
-                    f"Trajectory data not found. Please run parse() first or provide a DataFrame. "
-                    f"Expected file: {csv_path}"
-                )
-            
-            df = pd.read_csv(csv_path)
-            # Convert string representations back to dicts
-            if 'clusters_filling' in df.columns:
-                df['clusters_filling'] = df['clusters_filling'].apply(
-                    lambda x: ast.literal_eval(x) if isinstance(x, str) else x
-                )
-        
-        if df.empty:
-            raise ValueError("DataFrame is empty. Cannot create summary.")
-        
-        # Ensure DataFrame is sorted by frame
-        df = df.sort_values('frame').reset_index(drop=True)
-        
-        # Get all unique cluster numbers
-        cluster_numbers = sorted(self.cluster_contacts.keys())
-        
-        # Group frames into windows
-        total_frames = len(df)
-        num_windows = (total_frames + window_size - 1) // window_size  # Ceiling division
-        
-        # Initialize summary data
-        summary_data = []
-        
-        for window_idx in range(num_windows):
-            start_idx = window_idx * window_size
-            end_idx = min(start_idx + window_size, total_frames)
-            
-            window_df = df.iloc[start_idx:end_idx]
-            
-            # Get the frame number for this window (use the first frame in the window)
-            frame_number = int(window_df.iloc[0]['frame'])
-            
-            # Calculate mean fraction for each cluster in this window
-            window_summary = {'frame': frame_number}
-            
-            for cluster_num in cluster_numbers:
-                # Extract cluster filling values for this cluster from all frames in window
-                cluster_values = []
-                for clusters_dict in window_df['clusters_filling']:
-                    if isinstance(clusters_dict, dict):
-                        cluster_values.append(clusters_dict.get(cluster_num, 0.0))
-                    elif isinstance(clusters_dict, str):
-                        # Handle string representation
-                        clusters_dict = ast.literal_eval(clusters_dict)
-                        cluster_values.append(clusters_dict.get(cluster_num, 0.0))
-                    else:
-                        cluster_values.append(0.0)
-                
-                # Calculate mean for this cluster in this window
-                mean_fraction = np.mean(cluster_values) if cluster_values else 0.0
-                window_summary[f'cluster_{cluster_num}'] = mean_fraction
-            
-            summary_data.append(window_summary)
-        
-        # Create summary DataFrame
-        summary_df = pd.DataFrame(summary_data)
-        
-        # Set frame as index
-        summary_df = summary_df.set_index('frame')
-        
-        # Apply binary conversion if cutoff is provided
+        # Determine output path
+        base_name, output_dir = self._get_base_paths()
         if cutoff is not None:
-            # Convert all cluster columns to binary (0 or 1)
-            cluster_columns = [col for col in summary_df.columns if col.startswith('cluster_')]
-            for col in cluster_columns:
-                summary_df[col] = (summary_df[col] >= cutoff).astype(int)
+            output_csv_path = os.path.join(output_dir, f"{base_name}_summary_binary_{cutoff}.csv")
+        else:
+            output_csv_path = os.path.join(output_dir, f"{base_name}_summary.csv")
         
-        # Save to CSV if requested
-        if save_csv:
-            if output_csv_path is None:
-                # Auto-generate output path from input path
-                base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
-                output_dir = os.path.dirname(self.trajectory_file_path) or '.'
-                output_csv_path = os.path.join(output_dir, f"{base_name}_summary.csv")
-            
-            # Ensure output directory exists
-            output_dir = os.path.dirname(output_csv_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            
-            summary_df.to_csv(output_csv_path)
-        
-        return summary_df
+        # Call Rust function
+        folding_analysis_rs.summarize_trajectory(
+            trajectory_file=self.trajectory_file_path,
+            window_size=window_size,
+            cutoff=cutoff,
+            output_csv=output_csv_path
+        )
     
     def plot_summary(self,
-                    summary_df: Optional[pd.DataFrame] = None,
-                    df: Optional[pd.DataFrame] = None,
-                    window_size: int = 10000,
+                    cutoff: Optional[float] = None,
                     figsize: Tuple[int, int] = (14, 8),
-                    save_plot: bool = True,
-                    output_format: str = "png",
-                    show_plot: bool = True,
-                    cutoff: Optional[float] = None) -> None:
+                    output_format: str = "png") -> None:
         """
-        Plot each cluster column from the summary DataFrame as a time series.
+        Plot each cluster column from the summary CSV file as a time series.
+        
+        Loads summary data from {base_name}_summary.csv or {base_name}_summary_binary_{cutoff}.csv
+        based on the cutoff parameter.
         
         Args:
-            summary_df (pd.DataFrame): Summary DataFrame from summarize_trajectory().
-                If None, will call summarize_trajectory() automatically.
-            df (pd.DataFrame): DataFrame from parse() method. Required if summary_df is None.
-            window_size (int): Number of frames per window (default: 10000, only used if summary_df is None)
+            cutoff (float, optional): Cutoff value used for binary summary. If provided, loads
+                {base_name}_summary_binary_{cutoff}.csv. If None, loads {base_name}_summary.csv.
             figsize (Tuple[int, int]): Figure size (default: (14, 8))
-            save_plot (bool): Whether to save the plot (default: True)
             output_format (str): Output format - 'png' or 'svg' (default: 'png')
-            show_plot (bool): Whether to display the plot (default: True)
-            cutoff (float, optional): If provided, convert probabilities to binary (0 or 1) before plotting.
-                Values >= cutoff become 1, values < cutoff become 0. If None, plots float probabilities.
         """
-        # Generate summary if not provided
-        if summary_df is None:
-            if df is None:
-                raise ValueError("Either summary_df or df must be provided")
-            summary_df = self.summarize_trajectory(df=df, window_size=window_size, save_csv=True, cutoff=cutoff)
+        # Determine input CSV path
+        base_name, output_dir = self._get_base_paths()
+        if cutoff is not None:
+            summary_csv_path = os.path.join(output_dir, f"{base_name}_summary_binary_{cutoff}.csv")
+        else:
+            summary_csv_path = os.path.join(output_dir, f"{base_name}_summary.csv")
+        
+        if not os.path.exists(summary_csv_path):
+            raise FileNotFoundError(f"Summary CSV file not found: {summary_csv_path}")
+        
+        # Load summary DataFrame
+        summary_df = pd.read_csv(summary_csv_path, index_col=0)
         
         if summary_df.empty:
             raise ValueError("Summary DataFrame is empty. Cannot create plot.")
@@ -734,17 +479,15 @@ class Trajectory:
         # Adjust layout
         plt.tight_layout()
         
-        # Save plot if requested
-        if save_plot:
-            os.makedirs('results/plots', exist_ok=True)
-            base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
-            filename = f'results/plots/{base_name}_summary.{output_format}'
-            plt.savefig(filename, format=output_format, dpi=300, bbox_inches='tight')
-        
-        if show_plot:
-            plt.show()
+        # Save plot
+        os.makedirs('results/plots', exist_ok=True)
+        base_name, _ = self._get_base_paths()
+        if cutoff is not None:
+            filename = f'results/plots/{base_name}_summary_binary_{cutoff}.{output_format}'
         else:
-            plt.close()
+            filename = f'results/plots/{base_name}_summary.{output_format}'
+        plt.savefig(filename, format=output_format, dpi=300, bbox_inches='tight')
+        plt.close()
   
     def classify(self,
                 summary_df_or_path: Union[pd.DataFrame, str],
@@ -764,120 +507,31 @@ class Trajectory:
         Returns:
             List[int]: List of cluster numbers in formation order (last formed first)
         """
-        # Load summary DataFrame
+        # Determine summary CSV path
         if isinstance(summary_df_or_path, pd.DataFrame):
-            summary_df = summary_df_or_path.copy()
-            # Ensure index is integer (frame numbers)
-            if not isinstance(summary_df.index, pd.RangeIndex):
-                summary_df.index = summary_df.index.astype(int)
-            # Use trajectory file path for auto-generating output path
-            summary_csv_path = self.trajectory_file_path
+            # If DataFrame provided, use auto-load from expected path
+            summary_csv_path = None
         else:
             summary_csv_path = summary_df_or_path
             if not os.path.exists(summary_csv_path):
                 raise FileNotFoundError(f"Summary CSV file not found: {summary_csv_path}")
-            summary_df = pd.read_csv(summary_csv_path, index_col=0)
-            # Ensure index is integer (frame numbers)
-            summary_df.index = summary_df.index.astype(int)
         
-        # Get all cluster columns (excluding cluster_0)
-        cluster_columns = [col for col in summary_df.columns if col.startswith('cluster_') and col != 'cluster_0']
-        
-        if not cluster_columns:
-            raise ValueError("No cluster columns found in summary DataFrame (excluding cluster_0)")
-        
-        # Sort by frame number (ascending)
-        summary_df = summary_df.sort_index()
-        
-        # Step 2: Find first time all clusters (except cluster_0) are formed (all 1)
-        all_formed_mask = (summary_df[cluster_columns] == 1).all(axis=1)
-        all_formed_frames = summary_df.index[all_formed_mask]
-        
-        if len(all_formed_frames) == 0:
-            # No frame where all clusters are formed - find frame with maximum clusters formed
-            cluster_counts = (summary_df[cluster_columns] == 1).sum(axis=1)
-            max_clusters = cluster_counts.max()
-            
-            if max_clusters == 0:
-                raise ValueError("No clusters are formed in the trajectory. Cannot determine formation order.")
-            
-            # Use first frame where maximum number of clusters are formed
-            max_cluster_frames = cluster_counts[cluster_counts == max_clusters].index
-            start_frame = max_cluster_frames[0]
-        else:
-            # Use first frame where all clusters are formed
-            start_frame = all_formed_frames[0]
-        
-        # Step 3-5: Go backwards in time and track cluster breaks
-        # Find the index of the start_frame
-        start_idx = summary_df.index.get_loc(start_frame)
-        
-        # Track which clusters are currently formed (start with all formed)
-        currently_formed = set()
-        for col in cluster_columns:
-            if summary_df.loc[start_frame, col] == 1:
-                cluster_num = int(col.replace('cluster_', ''))
-                currently_formed.add(cluster_num)
-        
-        # List to store order of cluster breaks (going backwards)
-        cluster_breaks_order = []
-        
-        # Go backwards from start_frame
-        for idx in range(start_idx, -1, -1):
-            current_frame = summary_df.index[idx]
-            current_row = summary_df.loc[current_frame]
-            
-            # Check which clusters are formed at this frame
-            formed_at_frame = set()
-            for col in cluster_columns:
-                if current_row[col] == 1:
-                    cluster_num = int(col.replace('cluster_', ''))
-                    formed_at_frame.add(cluster_num)
-            
-            # Find clusters that were formed before but are now broken (1 -> 0)
-            broken_clusters = currently_formed - formed_at_frame
-            
-            # Add broken clusters to the list (in sorted order for consistency)
-            if broken_clusters:
-                for cluster_num in sorted(broken_clusters):
-                    cluster_breaks_order.append(cluster_num)
-            
-            # Update currently_formed to reflect current state
-            currently_formed = formed_at_frame.copy()
-            
-            # If all clusters (except cluster_0) are broken, we're done
-            if not currently_formed:
-                break
-        
-        # Step 6: If we reached the beginning and some clusters are still formed,
-        # append them to the end (these were formed before the trajectory started)
-        if currently_formed:
-            for cluster_num in sorted(currently_formed):
-                cluster_breaks_order.append(cluster_num)
-        
-        # Reverse the order to get formation order (last formed first in breaks = first formed last in formation)
-        formation_order = list(reversed(cluster_breaks_order))
-        
-        # Save to file
+        # Determine output path
         if output_path is None:
-            # Auto-generate output path from trajectory file path
-            base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
-            output_dir = os.path.dirname(self.trajectory_file_path) or '.'
+            base_name, output_dir = self._get_base_paths()
             output_path = os.path.join(output_dir, f"{base_name}_class.txt")
         
-        # Ensure output directory exists
-        output_dir = os.path.dirname(output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        
-        # Save as one-line file (comma-separated cluster numbers)
-        with open(output_path, 'w') as f:
-            f.write(','.join(map(str, formation_order)) + '\n')
+        # Call Rust function
+        formation_order = folding_analysis_rs.classify(
+            trajectory_file=self.trajectory_file_path,
+            summary_csv=summary_csv_path,
+            output_path=output_path
+        )
         
         return formation_order
         
     def animate(self,
-                df: Optional[pd.DataFrame] = None,
+                csv_path: Optional[str] = None,
                 interval: int = 50,
                 figsize: Tuple[int, int] = (12, 10),
                 save_animation: bool = True,
@@ -887,21 +541,33 @@ class Trajectory:
         Create an animated contact map showing which contacts are formed in each frame.
         
         Args:
-            df (pd.DataFrame): DataFrame from parse() method. If None, will call parse() automatically.
+            csv_path (str, optional): Path to parsed CSV file from read_trajectory().
+                If None, auto-generates from trajectory file path.
             interval (int): Delay between frames in milliseconds (default: 50)
             figsize (Tuple[int, int]): Figure size (default: (12, 10))
             save_animation (bool): Whether to save the animation (default: True)
             output_format (str): Output format - 'gif' or 'mp4' (default: 'gif')
             fps (int): Frames per second for saved animation (default: 20, only used for mp4)
         """
-        # If no DataFrame provided, read the trajectory
-        if df is None:
-            df = self.read_trajectory(save_csv=False, return_df=True)
-            if df is None:
-                df = pd.DataFrame()
+        # Determine CSV path
+        if csv_path is None:
+            base_name, output_dir = self._get_base_paths()
+            csv_path = os.path.join(output_dir, f"{base_name}_parsed.csv")
+        
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Trajectory CSV file not found: {csv_path}")
+        
+        # Load DataFrame from CSV
+        df = pd.read_csv(csv_path)
         
         if df.empty:
             raise ValueError("DataFrame is empty. Cannot create animation.")
+        
+        # Convert string representations back to lists if needed
+        if 'contact_list' in df.columns:
+            df['contact_list'] = df['contact_list'].apply(
+                lambda x: ast.literal_eval(x) if isinstance(x, str) else x
+            )
         
         # Ensure DataFrame is sorted by frame
         df = df.sort_values('frame').reset_index(drop=True)
@@ -961,7 +627,7 @@ class Trajectory:
         ax.legend(loc='upper right', fontsize=8)
         
         # Prepare data for animation - normalize all contacts to (min, max) format
-        def normalize_contact(contact):
+        def normalize_contact(contact: Union[tuple, list]) -> tuple:
             """Normalize contact to (min, max) format for consistent matching."""
             if isinstance(contact, (list, tuple)) and len(contact) == 2:
                 return (min(contact[0], contact[1]), max(contact[0], contact[1]))
@@ -1042,7 +708,7 @@ class Trajectory:
         # Save animation if requested
         if save_animation:
             os.makedirs('results/plots', exist_ok=True)
-            base_name = os.path.splitext(os.path.basename(self.trajectory_file_path))[0]
+            base_name, _ = self._get_base_paths()
             
             if output_format.lower() == 'gif':
                 filename = f'results/plots/{base_name}_contact_animation.gif'
@@ -1052,11 +718,11 @@ class Trajectory:
                 filename = f'results/plots/{base_name}_contact_animation.mp4'
                 print(f"Saving animation to {filename}...")
                 anim.save(filename, writer='ffmpeg', fps=fps)
-        else:
-            raise ValueError(f"Unsupported output format: {output_format}. Use 'gif' or 'mp4'.")
-        print(f"Animation saved successfully!")
+            else:
+                raise ValueError(f"Unsupported output format: {output_format}. Use 'gif' or 'mp4'.")
+            print(f"Animation saved successfully!")
         
         plt.tight_layout()
-        plt.show()
+        plt.close()
         
         return anim
