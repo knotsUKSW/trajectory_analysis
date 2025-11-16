@@ -429,6 +429,53 @@ cargo build --release
 
 This will create a release build of the Rust library in `rust/target/release/`.
 
+#### Building the Rust CLI Binary
+
+The Rust backend includes a standalone CLI tool that can be used without Python:
+
+```bash
+cd rust
+cargo build --release --bin folding-analysis
+```
+
+This creates a binary at `rust/target/release/folding-analysis` that can be used directly.
+
+**Usage Examples:**
+
+```bash
+# Read trajectory and calculate contact formation
+./target/release/folding-analysis read \
+    --trajectory data/unfolded_1/133.9/105/traj_test.pdb \
+    --contacts results/contacts_9_clusters.csv \
+    --cutoff-distance 1.2
+
+# Summarize trajectory (float mode)
+./target/release/folding-analysis summarize \
+    --input data/unfolded_1/133.9/105/traj_test_parsed.csv \
+    --window-size 10000
+
+# Summarize trajectory (binary mode with cutoff)
+./target/release/folding-analysis summarize \
+    --input data/unfolded_1/133.9/105/traj_test_parsed.csv \
+    --window-size 10000 \
+    --cutoff 0.5
+
+# Smooth trajectory data
+./target/release/folding-analysis smooth \
+    --input data/unfolded_1/133.9/105/traj_test_parsed.csv \
+    --window-size 100
+
+# Classify trajectory (determine cluster formation order)
+./target/release/folding-analysis classify \
+    --input data/unfolded_1/133.9/105/traj_test_summary_binary_0.5.csv
+```
+
+**All commands support:**
+- Auto-generated output paths (based on input file names)
+- Custom output paths via `--output` flag
+- Progress bars for long-running operations
+- Help text: `./target/release/folding-analysis --help` or `./target/release/folding-analysis <command> --help`
+
 #### Building Python Bindings
 
 The Python bindings are required for the Python code to work. To build them:
@@ -485,7 +532,9 @@ rust/
 │   ├── structure.rs   # Core data structures (Coordinate, FrameData)
 │   ├── trajectory.rs   # Trajectory trait and implementations
 │   ├── contacts.rs    # Contact-related structures
-│   └── python_bindings.rs  # PyO3 bindings for Python
+│   ├── python_bindings.rs  # PyO3 bindings for Python
+│   └── bin/
+│       └── main.rs     # Standalone CLI binary
 └── target/            # Build artifacts (generated)
 ```
 

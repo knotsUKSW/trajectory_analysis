@@ -960,7 +960,7 @@ fn save_classification_to_file(formation_order: &[i32], output_path: &Path) -> R
 }
 
 /// Load frame results from CSV file
-fn load_results_from_csv(csv_path: &Path) -> Result<Vec<FrameResult>, String> {
+pub fn load_results_from_csv(csv_path: &Path) -> Result<Vec<FrameResult>, String> {
     let mut reader = csv::Reader::from_path(csv_path)
         .map_err(|e| format!("Failed to open CSV file {}: {}", csv_path.display(), e))?;
     
